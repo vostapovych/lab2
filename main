@@ -1,0 +1,530 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <cmath>
+#include <random>
+#include <chrono>
+#include <memory>
+#include <cstdint>
+#include <unordered_set>
+#include <iomanip>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+using namespace std;
+
+// Константи завдання з методичних вказівок
+static const double CAPACITY_LIMIT = 1000000.0;     // n: максимальна кількість елементів
+static const double p = 0.01;                       // p: гранична ймовірність помилки (1%)
+static const size_t MAX_TOKEN_LENGTH = 15;          // максимальна довжина вхідного рядка
+
+// Перевірка допустимості слова: від 1 до 15 латинських літер
+static bool verify_token_syntax(const string& token){
+    if(token.empty() || token.size() > MAX_TOKEN_LENGTH){
+        return false;
+    }
+    for(char symbol : token){
+        bool is_lower_latin = (symbol >= 'a' && symbol <= 'z');
+        bool is_upper_latin = (symbol >= 'A' && symbol <= 'Z');
+        if(!is_lower_latin && !is_upper_latin){
+            return false;
+        }
+    }
+    return true;
+}
+
+// Розрахункові параметри структури за підручником
+struct BloomDimensions{
+    size_t m;
+    int l;
+};
+
+// Теоретична ймовірність помилки: (1 - e^(-l * n / m))^l
+static double forecast_false_positive_rate(double n, size_t m, int l){
+    double exponent_argument = -(double)l * n / (double)m;
+    return pow(1.0 - exp(exponent_argument), (double)l);
+}
+
+// Розрахунок оптимальних m та l
+static BloomDimensions derive_filter_setup(double n, double target_p){
+    const double natural_log_2 = log(2.0);
+    // m = -n * ln(p) / (ln 2)^2
+    double raw_m = -n * log(target_p) / (natural_log_2 * natural_log_2);
+    // l = (m / n) * ln 2
+    int optimal_l = (int)floor(raw_m / n * natural_log_2 + 0.5);
+    if(optimal_l < 1){
+        optimal_l = 1;
+    }
+
+    size_t adjusted_m = (size_t)ceil(raw_m);
+    // Корекція розміру масиву для компенсації дискретності l
+    while(forecast_false_positive_rate(n, adjusted_m, optimal_l) > target_p){
+        adjusted_m += (adjusted_m / 1000) + 1;
+    }
+    return BloomDimensions{ adjusted_m, optimal_l };
+}
+
+// Сімейство з l незалежних поліноміальних хеш-функцій
+class PolynomialHashSuite{
+    vector<uint64_t> base;
+
+    static uint64_t avalanche_mixer(uint64_t entropy_val){
+        entropy_val ^= entropy_val >> 30;
+        entropy_val *= 0xbf58476d1ce4e5b9ULL;
+        entropy_val ^= entropy_val >> 27;
+        entropy_val *= 0x94d049bb133111ebULL;
+        entropy_val ^= entropy_val >> 31;
+        return entropy_val;
+    }
+
+public:
+    PolynomialHashSuite(int l, uint64_t generator_seed) : base(l){
+        mt19937_64 pseudorand_engine(generator_seed);
+        for(auto& b : base){
+            b = pseudorand_engine() | 1ULL;
+        }
+    }
+
+    int routines_count() const{
+        return (int)base.size();
+    }
+
+    uint64_t evaluate(int routine_index, const string& text) const{
+        const uint64_t current_base = base[routine_index];
+        uint64_t accumulated_hash = 1;
+        for(size_t char_pos = text.size(); char_pos-- > 0;){
+            uint64_t code_point = (uint64_t)(unsigned char)text[char_pos] + 1;
+            accumulated_hash = accumulated_hash * current_base + code_point;
+        }
+        return avalanche_mixer(accumulated_hash);
+    }
+};
+
+// Абстрактний інтерфейс сховища фільтра
+class IBloomStorage{
+public:
+    virtual ~IBloomStorage(){}
+    virtual void insert_token(const string& token) = 0;
+    virtual bool lookup_token(const string& token) const = 0;
+    virtual bool purge_token(const string&) { return false; }
+    virtual bool has_delete_support() const { return false; }
+    virtual double occupancy_ratio() const = 0;
+    virtual size_t allocated_bytes() const = 0;
+    virtual const char* implementation_title() const = 0;
+    virtual size_t slot_count() const = 0;
+    virtual int hash_function_count() const = 0;
+};
+
+// Паралельний підрахунок встановлених бітів
+static int count_set_bits_64(uint64_t word_mask){
+    word_mask = word_mask - ((word_mask >> 1) & 0x5555555555555555ULL);
+    word_mask = (word_mask & 0x3333333333333333ULL) + ((word_mask >> 2) & 0x3333333333333333ULL);
+    word_mask = (word_mask + (word_mask >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    return (int)((word_mask * 0x0101010101010101ULL) >> 56);
+}
+
+// Класичний фільтр Блума на бітовому масиві
+class BloomFilter : public IBloomStorage{
+    size_t m;
+    PolynomialHashSuite hash_suite;
+    vector<uint64_t> bitfield;
+
+public:
+    BloomFilter(size_t m, int l, uint64_t seed_val)
+            : m(m),
+              hash_suite(l, seed_val),
+              bitfield((m + 63) / 64, 0ULL){
+    }
+
+    void insert_token(const string& token) override{
+        for(int idx = 0; idx < hash_suite.routines_count(); ++idx){
+            size_t mapped_bit = (size_t)(hash_suite.evaluate(idx, token) % m);
+            bitfield[mapped_bit >> 6] |= (1ULL << (mapped_bit & 63));
+        }
+    }
+
+    bool lookup_token(const string& token) const override{
+        for(int idx = 0; idx < hash_suite.routines_count(); ++idx){
+            size_t mapped_bit = (size_t)(hash_suite.evaluate(idx, token) % m);
+            if(((bitfield[mapped_bit >> 6] >> (mapped_bit & 63)) & 1ULL) == 0ULL){
+                return false;
+            }
+        }
+        return true;
+    }
+
+    double occupancy_ratio() const override{
+        size_t active_bits = 0;
+        for(uint64_t block : bitfield){
+            active_bits += count_set_bits_64(block);
+        }
+        return (double)active_bits / (double)m;
+    }
+
+    size_t allocated_bytes() const override{
+        return bitfield.size() * sizeof(uint64_t);
+    }
+
+    const char* implementation_title() const override{
+        return "Класичний (бітовий масив)";
+    }
+
+    size_t slot_count() const override{
+        return m;
+    }
+
+    int hash_function_count() const override{
+        return hash_suite.routines_count();
+    }
+};
+
+// Лічильникова модифікація (Counting Bloom Filter)
+class CountingBloomFilter : public IBloomStorage{
+    size_t m;
+    PolynomialHashSuite hash_suite;
+    vector<uint8_t> cell_tallies;
+
+public:
+    CountingBloomFilter(size_t m, int l, uint64_t seed_val)
+            : m(m),
+              hash_suite(l, seed_val),
+              cell_tallies(m, 0){
+    }
+
+    void insert_token(const string& token) override{
+        for(int idx = 0; idx < hash_suite.routines_count(); ++idx){
+            uint8_t& counter_ref = cell_tallies[(size_t)(hash_suite.evaluate(idx, token) % m)];
+            if(counter_ref < 255){
+                ++counter_ref;
+            }
+        }
+    }
+
+    bool lookup_token(const string& token) const override{
+        for(int idx = 0; idx < hash_suite.routines_count(); ++idx){
+            if(cell_tallies[(size_t)(hash_suite.evaluate(idx, token) % m)] == 0){
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool purge_token(const string& token) override{
+        if(!lookup_token(token)){
+            return false;
+        }
+        for(int idx = 0; idx < hash_suite.routines_count(); ++idx){
+            uint8_t& counter_ref = cell_tallies[(size_t)(hash_suite.evaluate(idx, token) % m)];
+            if(counter_ref > 0 && counter_ref < 255){
+                --counter_ref;
+            }
+        }
+        return true;
+    }
+
+    bool has_delete_support() const override{
+        return true;
+    }
+
+    double occupancy_ratio() const override{
+        size_t populated_cells = 0;
+        for(uint8_t cell_val : cell_tallies){
+            if(cell_val != 0){
+                ++populated_cells;
+            }
+        }
+        return (double)populated_cells / (double)m;
+    }
+
+    size_t allocated_bytes() const override{
+        return cell_tallies.size() * sizeof(uint8_t);
+    }
+
+    const char* implementation_title() const override{
+        return "Лічильниковий (8-бітні лічильники)";
+    }
+
+    size_t slot_count() const override{
+        return m;
+    }
+
+    int hash_function_count() const override{
+        return hash_suite.routines_count();
+    }
+};
+
+// Фабричний метод створення фільтра
+static unique_ptr<IBloomStorage> instantiate_filter(bool use_counters, size_t m, int l, uint64_t seed){
+    if(use_counters){
+        return unique_ptr<IBloomStorage>(new CountingBloomFilter(m, l, seed));
+    }
+    return unique_ptr<IBloomStorage>(new BloomFilter(m, l, seed));
+}
+
+// Генерація випадкового латинського рядка
+static string synthesize_random_word(mt19937_64& prng){
+    uniform_int_distribution<int> length_picker(1, (int)MAX_TOKEN_LENGTH);
+    uniform_int_distribution<int> char_picker(0, 25);
+    int target_len = length_picker(prng);
+    string result_word(target_len, 'a');
+    for(int pos = 0; pos < target_len; ++pos){
+        result_word[pos] = (char)('a' + char_picker(prng));
+    }
+    return result_word;
+}
+
+// Красиве виведення поточної статистики стану фільтра
+static void print_telemetry(const IBloomStorage& filter_instance){
+    double fill = filter_instance.occupancy_ratio();
+    cout << "\n=======================================================\n";
+    cout << "             ПОТОЧНИЙ СТАН ФІЛЬТРА БЛУМА               \n";
+    cout << "=======================================================\n";
+    cout << "Тип структури          : " << filter_instance.implementation_title() << "\n";
+    cout << "Розмірність m (позицій): " << filter_instance.slot_count() << "\n";
+    cout << "Хеш-функцій l          : " << filter_instance.hash_function_count() << "\n";
+    cout << "Виділена пам'ять       : " << fixed << setprecision(3)
+         << ((double)filter_instance.allocated_bytes() / (1024.0 * 1024.0)) << " МіБ\n";
+    cout << "Частка заповнення (f)  : " << fixed << setprecision(2) << (fill * 100.0) << "%\n";
+    cout << "Оцінка поточної FP     : " << fixed << setprecision(4)
+         << (pow(fill, filter_instance.hash_function_count()) * 100.0) << "%\n";
+    cout << "=======================================================\n";
+}
+
+// Запуск діагностичного самотесту
+static void run_diagnostic_test(bool use_counters, size_t m, int l,
+                                long long items_count, long long absent_probes, uint64_t seed){
+    typedef chrono::steady_clock HighResClock;
+    mt19937_64 benchmark_rng(seed);
+    unique_ptr<IBloomStorage> test_filter = instantiate_filter(use_counters, m, l, seed + 1);
+
+    unordered_set<string> ground_truth_set;
+    vector<string> unique_words;
+    ground_truth_set.reserve(items_count);
+    unique_words.reserve(items_count);
+
+    auto t0 = HighResClock::now();
+    while((long long)unique_words.size() < items_count){
+        string word = synthesize_random_word(benchmark_rng);
+        if(ground_truth_set.insert(word).second){
+            test_filter->insert_token(word);
+            unique_words.push_back(word);
+        }
+    }
+    auto t1 = HighResClock::now();
+
+    // 1. Контроль відсутності хибнонегативних (False Negatives)
+    long long false_negatives = 0;
+    for(const string& word : unique_words){
+        if(!test_filter->lookup_token(word)){
+            ++false_negatives;
+        }
+    }
+
+    // 2. Вимірювання хибнопозитивних (False Positives)
+    long long tested_absent = 0;
+    long long false_positives = 0;
+    auto t2 = HighResClock::now();
+    for(long long i = 0; i < absent_probes; ++i){
+        string unseen = synthesize_random_word(benchmark_rng);
+        if(ground_truth_set.count(unseen)){
+            continue;
+        }
+        ++tested_absent;
+        if(test_filter->lookup_token(unseen)){
+            ++false_positives;
+        }
+    }
+    auto t3 = HighResClock::now();
+
+    double add_ms = chrono::duration<double, milli>(t1 - t0).count();
+    double check_ms = chrono::duration<double, milli>(t3 - t2).count();
+    double measured_fp_pct = tested_absent ? (100.0 * (double)false_positives / (double)tested_absent) : 0.0;
+    double fill = test_filter->occupancy_ratio();
+
+    cout << "\n------------------ Результати діагностики ------------------\n";
+    cout << "Параметри тесту: додано = " << unique_words.size() << " слів, перевірок відсутніх = " << tested_absent << "\n";
+    cout << "Точність структури:\n";
+    cout << "  Хибнонегативні (FN) : " << false_negatives << " (повинно бути строго 0)\n";
+    cout << "  Хибнопозитивні (FP) : " << false_positives << " (" << fixed << setprecision(3)
+         << measured_fp_pct << "% при цільових " << (p * 100.0) << "%)\n";
+    cout << "Швидкодія та пам'ять:\n";
+    cout << "  Час наповнення      : " << fixed << setprecision(2) << add_ms << " мс ("
+         << ((add_ms * 1000.0) / (double)unique_words.size()) << " мкс/вставка)\n";
+    cout << "  Час опитування      : " << fixed << setprecision(2) << check_ms << " мс ("
+         << ((check_ms * 1000.0) / (double)tested_absent) << " мкс/запит)\n";
+    cout << "  Коефіцієнт заповн.  : " << fixed << setprecision(2) << (fill * 100.0) << "%\n";
+    cout << "------------------------------------------------------------\n";
+}
+
+// Меню довідки для Лабораторної роботи №3
+static void print_help(const IBloomStorage& filter_instance){
+    cout << "=====================================================================\n";
+    cout << "           ЛАБОРАТОРНА РОБОТА № 3: ФІЛЬТР БЛУМА                     \n";
+    cout << "=====================================================================\n";
+    cout << "Конфігурація фільтра:\n";
+    cout << "  - Режим роботи      : " << filter_instance.implementation_title() << "\n";
+    cout << "  - Максимум елементів: n = 1 000 000 слів\n";
+    cout << "  - Гранична помилка  : p = 1.0%\n";
+    cout << "  - Розмір масиву     : m = " << filter_instance.slot_count() << " позицій ("
+         << fixed << setprecision(2) << ((double)filter_instance.allocated_bytes() / (1024.0 * 1024.0)) << " МіБ)\n";
+    cout << "  - Число хеш-функцій : l = " << filter_instance.hash_function_count() << "\n";
+    cout << "---------------------------------------------------------------------\n";
+    cout << "ДОСТУПНІ ОПЕРАЦІЇ ТА КОМАНДИ:\n\n";
+    cout << " 1. Операції над множиною:\n";
+    cout << "    + <рядок>        - Додати рядок до фільтра (наприклад: + apple)\n";
+    if(filter_instance.has_delete_support()){
+        cout << "    - <рядок>        - Вилучити рядок (режим лічильників)\n";
+    }
+    cout << "    ? <рядок>        - Перевірити наявність (виводить 'Y' або 'N')\n\n";
+    cout << " 2. Моніторинг та аналітика:\n";
+    cout << "    stat             - Вивести поточну статистику заповнення бітів\n";
+    cout << "    test <N> <Q> [s] - Провести самотест на N вставках та Q запитах\n";
+    cout << "                       (Приклад: test 100000 100000 42)\n";
+    cout << "    help             - Показати це меню знову\n";
+    cout << "    #                - Завершити роботу програми\n";
+    cout << "=====================================================================\n";
+    cout << "Введіть команду або операцію:\n\n" << flush;
+}
+
+int main(int argc, char* argv[]){
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
+    ios_base::sync_with_stdio(false);
+    cin.tie(&cout);
+
+    bool counting_mode_flag = false;
+    string input_filepath;
+    for(int arg_idx = 1; arg_idx < argc; ++arg_idx){
+        string argument = argv[arg_idx];
+        if(argument == "--counting" || argument == "-c"){
+            counting_mode_flag = true;
+        }
+        else{
+            input_filepath = argument;
+        }
+    }
+
+    ifstream file_stream;
+    if(!input_filepath.empty()){
+        file_stream.open(input_filepath.c_str());
+        if(!file_stream){
+            cerr << "Помилка відкриття файлу: " << input_filepath << "\n";
+            return 1;
+        }
+    }
+    istream& command_source = input_filepath.empty() ? cin : file_stream;
+
+    BloomDimensions setup = derive_filter_setup(CAPACITY_LIMIT, p);
+    uint64_t initial_entropy = (uint64_t)chrono::steady_clock::now().time_since_epoch().count();
+    unique_ptr<IBloomStorage> active_filter = instantiate_filter(counting_mode_flag, setup.m, setup.l, initial_entropy);
+
+    if(input_filepath.empty()){
+        print_help(*active_filter);
+        cout << "Введіть команду > " << flush;
+    }
+
+    long long total_instructions = 0;
+    long long malformed_inputs = 0;
+    auto execution_timer_start = chrono::steady_clock::now();
+
+    string stream_record;
+    while(getline(command_source, stream_record)){
+        if(stream_record.empty()){
+            if(input_filepath.empty()) cout << "Введіть команду > " << flush;
+            continue;
+        }
+
+        stringstream tokenizer(stream_record);
+        string operation_code;
+        tokenizer >> operation_code;
+
+        if(operation_code == "#"){
+            break;
+        }
+
+        if(operation_code == "help"){
+            print_help(*active_filter);
+        }
+        else if(operation_code == "stat"){
+            print_telemetry(*active_filter);
+        }
+        else if(operation_code == "test"){
+            long long sample_n = 0, query_q = 0;
+            if(tokenizer >> sample_n >> query_q){
+                if(sample_n <= 0 || query_q <= 0){
+                    cout << "Помилка: N та Q мають бути більшими за 0\n";
+                }
+                else{
+                    uint64_t custom_seed = 42;
+                    uint64_t input_seed;
+                    if(tokenizer >> input_seed){
+                        custom_seed = input_seed;
+                    }
+                    run_diagnostic_test(counting_mode_flag, setup.m, setup.l, sample_n, query_q, custom_seed);
+                }
+            }
+            else{
+                cout << "Формат: test <N_елементів> <Q_перевірок> [seed]\n";
+            }
+        }
+        else if(operation_code == "+" || operation_code == "-" || operation_code == "?"){
+            string payload;
+            if(tokenizer >> payload){
+                ++total_instructions;
+                bool is_syntax_correct = verify_token_syntax(payload);
+                if(!is_syntax_correct){
+                    ++malformed_inputs;
+                    if(operation_code == "?") cout << "N\n";
+                    else cout << "Помилка: рядок має містити лише 1-15 латинських літер\n";
+                }
+                else{
+                    if(operation_code == "+"){
+                        active_filter->insert_token(payload);
+                    }
+                    else if(operation_code == "?"){
+                        cout << (active_filter->lookup_token(payload) ? "Y\n" : "N\n");
+                    }
+                    else{ // "-"
+                        if(!active_filter->has_delete_support()){
+                            cout << "Помилка: класичний фільтр не підтримує вилучення (запустіть з прапорцем --counting)\n";
+                        }
+                        else{
+                            active_filter->purge_token(payload);
+                        }
+                    }
+                }
+            }
+            else{
+                cout << "Помилка: вкажіть слово після '" << operation_code << "'\n";
+            }
+        }
+        else{
+            cout << "Невідома команда: '" << operation_code << "'. Введіть 'help' для довідки.\n";
+        }
+
+        if(input_filepath.empty()){
+            cout << "\nВведіть команду > " << flush;
+        }
+    }
+
+    auto execution_timer_end = chrono::steady_clock::now();
+    double total_elapsed_ms = chrono::duration<double, milli>(execution_timer_end - execution_timer_start).count();
+
+    cout << "\n=======================================================\n";
+    cout << "Сесію завершено.\n";
+    cout << "Опрацьовано запитів : " << total_instructions << "\n";
+    cout << "Час роботи програми : " << fixed << setprecision(3) << total_elapsed_ms << " мс\n";
+    if(malformed_inputs){
+        cout << "Відхилено рядків    : " << malformed_inputs << " (довжина > 15 або не латина)\n";
+    }
+    cout << "=======================================================\n";
+
+    return 0;
+}
